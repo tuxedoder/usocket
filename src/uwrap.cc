@@ -420,16 +420,15 @@ namespace uwrap {
 
 		bool readLoop() {
 			while (is_ready()) {
-				// Try to get a good sized buffer to read.
 				int avail = 1024;
 				if (ioctl(get_handle(), FIONREAD, &avail) >= 0)
 					avail = std::min(std::max(avail + 64, 256), 64 * 1024 * 1024);
 
-				// Build the message header.
 				char ctrlBuf[CMSG_SPACE(64 * sizeof(int))];
 				msghdr message = {};
 				iovec iov[1];
 
+				// Allocate buffer for incoming data
 				iov[0].iov_base = malloc(avail);
 				iov[0].iov_len = avail;
 
@@ -440,7 +439,6 @@ namespace uwrap {
 				message.msg_iov = iov;
 				message.msg_iovlen = 1;
 
-				// Try to recv a message.
 				int res = recvmsg(get_handle(), &message, 0);
 				if (res < 0) {
 					int err = errno;
@@ -448,38 +446,41 @@ namespace uwrap {
 					if (err == EAGAIN || err == EWOULDBLOCK)
 						return true;
 					_pause();
-					callback("error", Nan::ErrnoException(err, "recvmesg", "USocket", PATH_LINE()));
+					callback("error", Nan::ErrnoException(err, "recvmsg", "USocket", PATH_LINE()));
 					return false;
 				}
 
-				// Grab any file descriptors from the message.
+				// Prepare data buffer for JS
+				v8::Local<v8::Value> buffer = Nan::Undefined();
+				if (res > 0) {
+					Nan::MaybeLocal<v8::Object> buf = Nan::CopyBuffer(static_cast<char*>(iov[0].iov_base), res);
+					if (!buf.IsEmpty()) {
+						buffer = buf.ToLocalChecked();
+					}
+				}
+				free(iov[0].iov_base);
+
+				// Process file descriptors
+				v8::Local<v8::Value> jsfds = Nan::Undefined();
 				std::vector<int> fds;
 				for (cmsghdr *c = CMSG_FIRSTHDR(&message); c != NULL; c = CMSG_NXTHDR(&message, c)) {
 					if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) {
-						int count = (c->cmsg_len - CMSG_LEN(sizeof(int))) / sizeof(int) + 1;
+						int count = (c->cmsg_len - CMSG_LEN(sizeof(int))) / sizeof(int);
 						fds.resize(fds.size() + count);
 						memcpy(&fds.front() + fds.size() - count, CMSG_DATA(c), count * sizeof(int));
 					}
 				}
 
-				// Create a buffer of any read data.
-				v8::Local<v8::Value> buffer = Nan::Undefined();
-				if (res == 0 || !Nan::CopyBuffer(static_cast<char*>(iov[0].iov_base), res).ToLocal(&buffer))
-					free(iov[0].iov_base);
-
-				// Convert the descriptors into a v8 array
-				v8::Local<v8::Value> jsfds = Nan::Undefined();
 				if (fds.size() > 0) {
 					v8::Local<v8::Array> t = Nan::New<v8::Array>(fds.size());
-					for (size_t i = 0; i < fds.size(); i += 1)
+					for (size_t i = 0; i < fds.size(); i++)
 						Nan::Set(t, i, Nan::New(fds[i]));
 					jsfds = t;
 				}
 
-				// Callback with the data.
+				// Callback with data
 				callback("data", buffer, jsfds);
 			}
-
 			return true;
 		}
 
